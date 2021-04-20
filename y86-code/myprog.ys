@@ -1,2 +1,12 @@
 # Design your own testcase here
+irmovq $10, %rax
+irmovq $5, %rdx
+nop
+nop
+nop
+rmmovq %rdx, 0(%rax)
+nop
+nop
+nop
+mrmovq (%rax), %rbx
 halt

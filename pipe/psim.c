@@ -517,6 +517,79 @@ static byte_t sim_step_pipe(word_t ccount)
 void do_fetch_stage()
 {
     /* your implementation */
+    // Select correct program counter
+    // TODO: handle hazards
+    if(!memory_output->takebranch) {
+        f_pc = memory_output->vala;
+    } else if(writeback_output->icode == I_RET){
+        f_pc = writeback_output->valm;
+    } else {
+        f_pc = fetch_output->predPC;
+    }
+    
+
+    // Get op code
+    byte_t instr;
+    imem_error = !get_byte_val(mem, f_pc, &instr);
+    if(!imem_error) { // TODO: handle error
+        imem_icode = GET_ICODE(instr);
+        imem_ifun = GET_FUN(instr);
+        decode_input->icode = imem_icode;
+        decode_input->ifun = imem_ifun;
+
+        // Fetch parameters
+        instr_ptr instrInfo = find_instr(iname(instr));
+        instr_valid = instrInfo == NULL ? false : true;
+
+        if(instr_valid) {
+            // Register arguments
+            if(instrInfo->arg1 == R_ARG || instrInfo->arg2 == R_ARG) {
+                byte_t registers;
+                imem_error = !get_byte_val(mem, f_pc + 1, &registers); // TODO: handle error
+                if(!imem_error) {
+                    decode_input->ra = GET_RA(registers);
+                    decode_input->rb = GET_RB(registers);
+                }
+            }
+
+            // Immediate data
+            if(!imem_error && (instrInfo->arg1 == I_ARG || instrInfo->arg1 == M_ARG || instrInfo->arg2 == M_ARG)) {
+                int displacement = instrInfo->arg2 == NO_ARG ? 1 : 2;
+                word_t valc;
+                imem_error = !get_word_val(mem, f_pc + displacement, &valc);
+                if(!imem_error) {
+                    decode_input->valc = valc;
+                }
+            }
+
+            // valp
+            if(!imem_error) {
+                decode_input->valp = f_pc + instrInfo->bytes;
+            }
+
+            // Predict PC
+            if(imem_icode == I_CALL || imem_icode == I_JMP) {
+                fetch_input->predPC = decode_input->valc;
+            } else {
+                fetch_input->predPC = decode_input->valp;
+            }
+        }
+        
+    }
+
+    // Update Status
+    if(imem_error) {
+        decode_input->status = STAT_ADR;
+        fetch_input->status = STAT_ADR;
+    } else if(!instr_valid) {
+        decode_input->status = STAT_INS;
+        fetch_input->status = STAT_INS;
+    } else if(imem_icode == I_HALT) {
+        decode_input->status = STAT_HLT;
+        fetch_input->status = STAT_HLT;
+    } else {
+        decode_input->status = STAT_AOK;
+    }
 
     /* logging function, do not change this */
     if (!imem_error) {
@@ -534,6 +607,56 @@ void do_fetch_stage()
 void do_decode_stage()
 {
     /* your implementation */
+    execute_input->icode = decode_output->icode;
+    execute_input->ifun = decode_output->ifun;
+    execute_input->valc = decode_output->valc;
+    execute_input->deste = REG_NONE;
+    execute_input->destm = REG_NONE;
+
+    if(decode_output->status != STAT_AOK) {
+        execute_input->status = decode_output->status;
+        return;
+    }
+
+    byte_t code = decode_output->icode;
+
+    // valA
+    if(code == I_ALU || code == I_RMMOVQ || code == I_MRMOVQ || code == I_PUSHQ || code == I_RRMOVQ) {
+        d_regvala = get_reg_val(reg, decode_output->ra);
+        execute_input->vala = d_regvala;
+        execute_input->srca = decode_output->ra;
+    } else if(code == I_POPQ || code == I_RET) {
+        execute_input->vala = get_reg_val(reg, REG_RSP);
+        execute_input->srca = REG_RSP;
+    } else if(code == I_CALL || code == I_JMP) {
+        execute_input->vala = decode_output->valp;
+    }
+    
+
+    // valB
+    if(code == I_ALU || code == I_RMMOVQ || code == I_MRMOVQ || code == I_IRMOVQ || code == I_RRMOVQ) {
+        d_regvalb = get_reg_val(reg, decode_output->rb);
+        execute_input->valb = d_regvalb;
+        execute_input->srcb = decode_output->rb;
+    } else if(code == I_PUSHQ || code == I_POPQ || code == I_CALL || code == I_RET) {
+        execute_input->valb = get_reg_val(reg, REG_RSP);
+        execute_input->srcb = REG_RSP;
+    }
+    
+    // destE
+    if(code == I_ALU || code == I_PUSHQ || code == I_POPQ || code == I_CALL || code == I_RET || code == I_IRMOVQ || code == I_RRMOVQ) {
+        execute_input->deste = execute_input->srcb;
+    }
+
+    // destM
+    if(code == I_MRMOVQ || code == I_POPQ) {
+        execute_input->destm = decode_output->ra;
+    }
+
+    // TODO: handle stalling and forwarding
+    // Status
+    execute_input->status = STAT_AOK;
+
 }
 
 /************************** Execute stage **************************
@@ -552,6 +675,73 @@ void do_execute_stage()
     alua = alub = 0;
 
     /* your implementation */
+
+    // Initialize values
+    byte_t code = execute_output->icode;
+    alua = e_vala = execute_output->vala;
+    alub = e_valb = execute_output->valb;
+    word_t vale;
+    
+
+    // Pass on values   
+    memory_input->icode = code;
+    memory_input->ifun = execute_output->ifun;
+    memory_input->vala = alua;
+    memory_input->deste = execute_output->deste;
+    memory_input->destm = execute_output->destm;
+    memory_input->srca = execute_output->srca;
+    memory_input->takebranch = true;
+
+    if(execute_output->status != STAT_AOK) {
+        memory_input->status = execute_output->status;
+        return;
+    }
+
+    // Execute instruction
+    switch(code) {
+        case I_ALU:
+            // Perform calculation
+            alufun = execute_output->ifun;
+            vale = compute_alu(alufun, alua, alub);
+            cc_in = compute_cc(alufun, alua, alub);
+            memory_input->vale = vale;
+            setcc = true;
+            break;
+        case I_RMMOVQ:
+        case I_MRMOVQ:
+            // Calculate memory address
+            vale = e_valb + execute_output->valc;
+            memory_input->vale = vale;
+            break;
+        case I_IRMOVQ:
+            // Put value to be stored in vale
+            vale = execute_output->valc;
+            memory_input->vale = vale;
+            break;
+        case I_PUSHQ:
+        case I_CALL:
+            // Calculate space needed on stack pointer
+            vale = e_valb - 8;
+            memory_input->vale = vale;
+            break;
+        case I_POPQ:
+        case I_RET:
+            // Calculate new stack pointer
+            vale = e_valb + 8;
+            memory_input->vale = vale;
+            break;
+        case I_JMP:
+            // Determine if branch is taken
+            memory_input->takebranch = cond_holds(cc, execute_output->ifun);
+            break;
+        case I_RRMOVQ:
+            // Put value to be stored in vale
+            vale = execute_output->vala;
+            memory_input->vale = vale;
+            break;
+    }
+
+    memory_input->status = STAT_AOK;
 
     /* logging functions, do not change these */
     if (execute_output->icode == I_JMP) {
@@ -584,6 +774,48 @@ void do_memory_stage()
 
     /* your implementation */
 
+    byte_t code = memory_output->icode;
+
+    // Pass on values
+    writeback_input->icode = code;
+    writeback_input->ifun = memory_output->ifun;
+    writeback_input->vale = memory_output->vale;
+    writeback_input->deste = memory_output->deste;
+    writeback_input->destm = memory_output->destm;
+
+    if(memory_output->status != STAT_AOK) {
+        writeback_input->status = memory_output->status;
+        return;
+    }
+
+    // Handle instruction
+    word_t valm;
+    switch(code) {
+        case I_RMMOVQ:
+        case I_PUSHQ:
+        case I_CALL:
+            mem_addr = memory_output->vale;
+            mem_data = memory_output->vala;
+            mem_write = true;
+            dmem_error = !set_word_val(mem, mem_addr, mem_data);
+            break;
+        case I_MRMOVQ:
+            mem_addr = memory_output->vale;
+            mem_read = true;
+            dmem_error = !get_word_val(mem, mem_addr, &valm);
+            writeback_input->valm = valm;
+            break;
+        case I_RET:
+        case I_POPQ:
+            mem_addr = memory_output->vala;
+            mem_read = true;
+            dmem_error = !get_word_val(mem, mem_addr, &valm);
+            writeback_input->valm = valm;
+            break;
+    }
+
+    writeback_input->status = dmem_error ? STAT_ADR : STAT_AOK;
+
     if (mem_read) {
         if ((dmem_error |= !get_word_val(mem, mem_addr, &mem_data))) {
             sim_log("\tMemory: Couldn't Read from 0x%llx\n", mem_addr);
@@ -608,12 +840,17 @@ void do_memory_stage()
 void do_writeback_stage()
 {
     /* dummy placeholders, replace them with your implementation */
-    wb_destE = REG_NONE;
-    wb_valE  = 0;
-    wb_destM = REG_NONE;
-    wb_valM  = 0;
+    wb_destE = writeback_output->deste;
+    wb_valE  = writeback_output->vale;
+    wb_destM = writeback_output->destm;
+    wb_valM  = writeback_output->valm;
 
     /* your implementation */
+
+    if(writeback_output->status == STAT_AOK) {
+        set_reg_val(reg, wb_destE, wb_valE);
+        set_reg_val(reg, wb_destM, wb_valM);
+    }
 
     status = writeback_output->status;
     if (wb_destE != REG_NONE &&  writeback_output -> status == STAT_AOK) {
@@ -644,6 +881,188 @@ p_stat_t pipe_cntl(char *name, word_t stall, word_t bubble)
     }
 }
 
+typedef struct {
+    itype_t name;     // Name of instruction
+
+    // Reading set
+    bool readra;    // Whether or not the instruction reads ra
+    bool readrb;    // Whether or not the instruction reads rb
+    bool readrspa;
+    bool readrspb;   // Whether or not the instruction reads rsp
+
+    // Writing set
+    bool writedeste;// Whether or not the instruction reads deste
+    bool writedestm;// Whether or not the instruction reads destm
+
+    // Condition codes
+    bool readCond;  // Whether or not the instruction reads condition flags
+    bool writeCond; // Whether or not the instruction writes condition flages
+
+    // Fowarding stage
+    stage_id_t stage; // Gives the first stage where forwarding is possible
+} rwset_t, *rwset_ptr;
+
+rwset_t read_write_sets[] = 
+{
+    {I_HALT,    0,  0,  0,  0,  0,  0,  0}, 
+    {I_NOP,     0,  0,  0,  0,  0,  0,  0}, 
+    {I_RRMOVQ,  1,  0,  0,  0,  1,  0,  EXECUTE_STAGE}, 
+    {I_IRMOVQ,  0,  0,  0,  0,  1,  0,  EXECUTE_STAGE}, 
+    {I_RMMOVQ,  1,  1,  0,  0,  0,  0,  0}, 
+    {I_MRMOVQ,  1,  1,  0,  0,  0,  1,  MEMORY_STAGE},
+	{I_ALU,     1,  1,  0,  0,  1,  0,  EXECUTE_STAGE}, 
+    {I_JMP,     0,  0,  0,  0,  0,  0,  0}, 
+    {I_CALL,    0,  0,  0,  1,  1,  0,  EXECUTE_STAGE}, 
+    {I_RET,     0,  0,  1,  1,  1,  0,  EXECUTE_STAGE}, 
+    {I_PUSHQ,   1,  0,  0,  1,  1,  0,  EXECUTE_STAGE}, 
+    {I_POPQ,    0,  0,  1,  1,  1,  1,  MEMORY_STAGE}, 
+    {I_LEAQ,    0,  1,  0,  0,  1,  0,  EXECUTE_STAGE}, // TODO: double check leaq 
+    {I_VECADD,  1,  1,  0,  0,  1,  0,  EXECUTE_STAGE}, // TODO: double check 
+    {I_SHF,     1,  0,  0,  0,  1,  0,  EXECUTE_STAGE}
+};
+
+void getReadSet(decode_ptr decode, reg_id_t readSet[2]) {
+    // Get read-write set data for the instruction
+    itype_t code = decode->icode;
+    rwset_t readData = read_write_sets[code];
+
+    readSet[0] = REG_NONE;
+    readSet[1] = REG_NONE;
+
+    // Check if instruction reads ra
+    if(readData.readra) {
+        readSet[0] = decode->ra;
+    }
+
+    // Check if instruction reads rb
+    if(readData.readrb) {
+        readSet[1] = decode->rb;
+    }
+
+    // Check if instruction reads %rsp for vala
+    if(readData.readrspa) {
+        readSet[0] = REG_RSP;
+    }
+
+    // Check if instruction reads %rsp for valb
+    if(readData.readrspb) {
+        readSet[1] = REG_RSP;
+    }
+}
+
+void getWriteSet(stage_id_t stage, reg_id_t writeSet[2]) {
+
+    writeSet[0] = REG_NONE;
+    writeSet[1] = REG_NONE;
+
+    // Get the proper data depending on the stage
+    itype_t code;
+    byte_t deste;
+    byte_t destm;
+
+    switch(stage) {
+        case EXECUTE_STAGE:
+            code = execute_output->icode;
+            deste = execute_output->deste;
+            destm = execute_output->destm;
+            break;
+        case MEMORY_STAGE:
+            code = memory_output->icode;
+            deste = memory_output->deste;
+            destm = memory_output->destm;
+            break;
+        case WRITEBACK_STAGE:
+            code = writeback_output->icode;
+            deste = writeback_output->deste;
+            destm = writeback_output->destm;
+            break;
+        default:
+            // Not a stage that can cause a data dependency
+            return;
+    }
+
+    rwset_t writeData;
+
+    writeData = read_write_sets[code];
+
+    // Check if instruction writes deste
+    if(writeData.writedeste) {
+        writeSet[0] = deste;
+    }
+
+    // Check if instruction writes destm
+    if(writeData.writedestm) {
+        writeSet[1] = destm;
+    }
+}
+
+bool valADependent(reg_id_t readSet[2], reg_id_t writeSet[2]) {
+    if(readSet[0] == REG_NONE) {
+        return false;
+    }
+
+    if(readSet[0] == writeSet[0] || readSet[0] == writeSet[1]) {
+        return true;
+    }
+    return false;
+}
+
+bool valBDependent(reg_id_t readSet[2], reg_id_t writeSet[2]) {
+    if(readSet[1] == REG_NONE) {
+        return false;
+    }
+
+    if(readSet[1] == writeSet[0] || readSet[1] == writeSet[1]) {
+        return true;
+    }
+    return false;
+}
+
+bool forwardingPossible(reg_id_t readSet[2], reg_id_t writeSet[2], stage_id_t stage, bool a) {
+    stage_id_t earliestStage;
+
+    int index = !a;
+
+    if(readSet[index] == writeSet[0]) {
+        earliestStage = EXECUTE_STAGE;
+    } else if(readSet[index] == writeSet[1]) {
+        earliestStage = MEMORY_STAGE;
+    } else {
+        return false;
+    }
+
+    return stage >= earliestStage;
+}
+
+word_t getForwardValue(reg_id_t readSet[2], reg_id_t writeSet[2], stage_id_t stage, bool a) {
+    bool returnE;
+
+    int index = !a;
+
+    if(readSet[index] == writeSet[0]) {
+        // Dependent on eval
+        returnE = true;
+    } else {
+        // Dependent on mval
+        returnE = false;
+    }
+
+    switch(stage) {
+        case EXECUTE_STAGE:
+            return memory_input->vale;
+            break;
+        case MEMORY_STAGE:
+            return returnE ? writeback_input->vale : writeback_input->valm;
+            break;
+        case WRITEBACK_STAGE:
+            return returnE ? writeback_output->vale : writeback_output->valm;
+            break;
+        default:
+            // Invalid stage for forwarding
+            return -1;
+    }
+}
+
 /******************** Pipeline Register Control ********************
  * TODO: implement stalling or insert a bubble for different stages
  * by modifying the control operations of the pipeline registers
@@ -656,11 +1075,98 @@ void do_stall_check()
 {
     /* your implementation */
     // dummy placeholders to show the usage of pipe_cntl()
-    fetch_state->op     = pipe_cntl("PC", false, false);
-    decode_state->op    = pipe_cntl("ID", false, false);
-    execute_state->op   = pipe_cntl("EX", false, false);
-    memory_state->op    = pipe_cntl("MEM", false, false);
-    writeback_state->op = pipe_cntl("WB", false, false);
+
+    bool stallFetch = false;
+    bool bubbleFetch = false;
+    bool stallDecode = false;
+    bool bubbleDecode = false;
+    bool stallExecute = false;
+    bool bubbleExecute = false;
+    bool stallMemory = false;
+    bool bubbleMemory = false;
+    bool stallWriteback = false;
+    bool bubbleWriteback = false;
+
+    // Check stalling
+    reg_id_t decodeReadSet[2];
+    getReadSet(decode_output, decodeReadSet);
+
+    // Check data dependence
+    bool stall = false;
+    bool forwardA = false;
+    bool forwardB = false;
+    if(decodeReadSet[0] != REG_NONE || decodeReadSet[1] != REG_NONE) {
+        for(int i = 0; i < 3; i++) {
+            stage_id_t stages[] = {EXECUTE_STAGE, MEMORY_STAGE, WRITEBACK_STAGE};
+            reg_id_t writeSet[2];
+            getWriteSet(stages[i], writeSet);
+
+            if(writeSet[0] != REG_NONE || writeSet[1] != REG_NONE) {
+                // Check vala
+                if(!forwardA && valADependent(decodeReadSet, writeSet)) {
+                    // Handle forwarding
+                    if(forwardingPossible(decodeReadSet, writeSet, stages[i], true)) {
+                        execute_input->vala = getForwardValue(decodeReadSet, writeSet, stages[i], true);
+                        forwardA = true;
+                    } else {
+                        stall = true;
+                        break;
+                    }
+                }
+
+                // Check valb
+                if(!forwardB && valBDependent(decodeReadSet, writeSet)) {
+                    // Handle forwarding
+                    if(forwardingPossible(decodeReadSet, writeSet, stages[i], false)) {
+                        execute_input->valb = getForwardValue(decodeReadSet, writeSet, stages[i], false);
+                        forwardB = true;
+                    } else {
+                        stall = true;
+                        break;
+                    }
+                }
+            }
+            
+
+            if(forwardA && forwardB) {
+                break;
+            }
+        }
+    }
+
+    if(stall) {
+        stallFetch = true;
+        stallDecode = true;
+        bubbleExecute = true;
+    }
+
+    // Check for ret instruction
+    if( decode_output->icode == I_RET ||
+        execute_output->icode == I_RET ||
+        memory_output->icode == I_RET) {
+        
+        stallFetch = true;
+        bubbleDecode = true;
+    }
+
+    // Handle edge case
+    if(stallDecode && bubbleDecode) {
+        bubbleDecode = false;
+    }
+
+    // Handle mispredicted branches
+    if(!memory_input->takebranch) {
+        // Uh oh, mispredicted the branch
+        bubbleDecode = true;
+        stallDecode = false;
+        bubbleExecute = true;
+    }
+
+    fetch_state->op     = pipe_cntl("PC",   stallFetch,         bubbleFetch);
+    decode_state->op    = pipe_cntl("ID",   stallDecode,        bubbleDecode);
+    execute_state->op   = pipe_cntl("EX",   stallExecute,       bubbleExecute);
+    memory_state->op    = pipe_cntl("MEM",  stallMemory,        bubbleMemory);
+    writeback_state->op = pipe_cntl("WB",   stallWriteback,     bubbleWriteback);
 }
 
 /*
