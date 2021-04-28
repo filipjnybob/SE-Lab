@@ -36,6 +36,8 @@ int clean_eviction_count = 0;
 
 /* TODO: add more globals, structs, macros if necessary */
 
+uword_t lru_counter = 0;
+
 /*
  * Initialize the cache according to specified arguments
  * Called by cache-runner so do not modify the function signature
@@ -67,6 +69,7 @@ cache_t *create_cache(int s_in, int b_in, int E_in, int d_in)
     }
 
     /* TODO: add more code for initialization */
+    lru_counter = 0;
 
     return cache;
 }
@@ -118,6 +121,82 @@ void free_cache(cache_t *cache)
     free(cache);
 }
 
+// Returns a bit mask to retrieve the first x bits
+uword_t getFirstXBitsMask(unsigned int x) {
+    if(x == 0) {
+        // No mask needed
+        return 0;
+    }
+    
+    uword_t mask = 1;
+
+    if(x >= 64) {
+        // Return all 1's
+        mask = 0;
+        mask = mask - 1;
+        return mask;
+    }
+
+    // Iterate and add x 1's to mask
+    uword_t power = 1;
+    for(int i = 1; i < x; i++) {
+        power *= 2;
+        mask += power;
+    }
+    return mask;
+}
+
+/*
+ * Returns the offset portion of the given address.
+ * Returns -1 in the case of an error.
+ */ 
+uword_t getOffset(cache_t *cache, uword_t addr) {
+    unsigned int offsetBits = cache->b;
+
+    if(offsetBits == 0) {
+        return 0;
+    } else if(offsetBits < 0 || offsetBits > ADDRESS_LENGTH) {
+        return -1;
+    }
+
+    return addr & getFirstXBitsMask(offsetBits);
+}
+
+/*
+ * Returns the set portion of the given address.
+ * Returns -1 in the case of an error.
+ */
+uword_t getSet(cache_t *cache, uword_t addr) {
+    unsigned int setBits = cache->s;
+
+    if(setBits == 0) {
+        return 0;
+    } else if(setBits < 0 || setBits > ADDRESS_LENGTH) {
+        return -1;
+    }
+
+    // Shift the address right so that the set bits are at the start
+    uword_t temp = addr >> cache->b;
+    
+    return temp & getFirstXBitsMask(setBits);
+}
+
+/*
+ * Returns the tag portion of the given address.
+ * Returns -1 in the case of an error.
+ */
+uword_t getTag(cache_t *cache, uword_t addr) {
+    unsigned int tagBits = ADDRESS_LENGTH - cache->b - cache->s;
+
+    if(tagBits == 0) {
+        return 0;
+    } else if(tagBits < 0 || tagBits > ADDRESS_LENGTH) {
+        return -1;
+    }
+
+    return addr >> (cache->b + cache->s);
+}
+
 /* TODO:
  * Get the line for address contained in the cache
  * On hit, return the cache line holding the address
@@ -126,6 +205,24 @@ void free_cache(cache_t *cache)
 cache_line_t *get_line(cache_t *cache, uword_t addr)
 {
     /* your implementation */
+    uword_t set = getSet(cache, addr);
+    if(set == -1) {
+        return NULL;
+    }
+
+    cache_line_t* lines = cache->sets[set].lines;
+
+    unsigned int associativity = cache->E;
+    for(int i = 0; i < associativity; i++) {
+        cache_line_t* line = lines + i;
+        if(line->valid) {
+            if(line->tag == getTag(cache, addr)) {
+
+                return line;
+            }
+        }
+    }
+
     return NULL;
 }
 
@@ -136,7 +233,27 @@ cache_line_t *get_line(cache_t *cache, uword_t addr)
 cache_line_t *select_line(cache_t *cache, uword_t addr)
 {
     /* your implementation */
-    return NULL;
+    cache_line_t* line = get_line(cache, addr);
+    if(line != NULL) {
+        return line;
+    }
+
+    cache_line_t* lines = cache->sets[getSet(cache, addr)].lines;
+    uword_t earliestTime = 0;
+    unsigned int index = 0;
+    unsigned int associativity = cache->E;
+    for(int i = 0; i < associativity; i++) {
+        cache_line_t* line = lines + i;
+        if(!line->valid) {
+            return line;
+        }
+        if(line->lru <= earliestTime) {
+            earliestTime = line->lru;
+            index = i;
+        }
+    }
+
+    return lines + index;
 }
 
 /* TODO:
@@ -146,6 +263,19 @@ cache_line_t *select_line(cache_t *cache, uword_t addr)
 bool check_hit(cache_t *cache, uword_t addr, operation_t operation)
 {
     /* your implementation */
+    cache_line_t* line = get_line(cache, addr);
+    if(line != NULL) {
+        // Hit
+        hit_count++;
+        if(operation == WRITE) {
+            line->dirty = true;
+        }
+        line->lru = lru_counter;
+        lru_counter++;
+        return true;
+    }
+    //Miss
+    miss_count++;
     return false;
 }
 
@@ -159,6 +289,28 @@ evicted_line_t *handle_miss(cache_t *cache, uword_t addr, operation_t operation,
     evicted_line_t *evicted_line = malloc(sizeof(evicted_line_t));
     evicted_line->data = (byte_t *) calloc(B, sizeof(byte_t));
     /* your implementation */
+
+    cache_line_t* line = select_line(cache, addr);
+    if(line->valid) {
+        // Evict the line
+        evicted_line->data = line->data;
+        evicted_line->dirty = line->dirty;
+        evicted_line->valid = line->valid;
+        evicted_line->addr = line->tag + getSet(cache, addr);
+        line->dirty ? dirty_eviction_count++ : clean_eviction_count++;
+    }
+
+    line->data = incoming_data;
+    line->valid = true;
+    if(operation == WRITE) {
+        line->dirty = true;
+    } else {
+        line->dirty = false;
+    }
+    line->tag = getTag(cache, addr);
+    line->lru = lru_counter;
+    lru_counter++;
+
     return evicted_line;
 }
 
@@ -169,6 +321,16 @@ evicted_line_t *handle_miss(cache_t *cache, uword_t addr, operation_t operation,
 void get_byte_cache(cache_t *cache, uword_t addr, byte_t *dest)
 {
     /* your implementation */
+    cache_line_t* line = get_line(cache, addr);
+
+    if(line == NULL) {
+        return;
+    }
+
+    dest = &line->data[getOffset(cache, addr)];
+
+    line->lru = lru_counter;
+    lru_counter++;
 }
 
 
@@ -179,6 +341,20 @@ void get_byte_cache(cache_t *cache, uword_t addr, byte_t *dest)
 void get_word_cache(cache_t *cache, uword_t addr, word_t *dest) {
 
     /* your implementation */
+    cache_line_t* line = get_line(cache, addr);
+
+    if(line == NULL) {
+        return;
+    }
+
+    int offset = getOffset(cache, addr);
+    for(int i = 0; i < 8; i++) {
+        
+        *(dest + i) = line->data[offset + i];
+    }
+
+    line->lru = lru_counter;
+    lru_counter++;
 }
 
 
@@ -190,6 +366,17 @@ void set_byte_cache(cache_t *cache, uword_t addr, byte_t val)
 {
 
     /* your implementation */
+    cache_line_t* line = get_line(cache, addr);
+
+    if(line == NULL) {
+        return;
+    }
+
+    line->data[getOffset(cache,addr)] = val;
+    line->dirty = true;
+
+    line->lru = lru_counter;
+    lru_counter++;
 }
 
 
@@ -200,6 +387,18 @@ void set_byte_cache(cache_t *cache, uword_t addr, byte_t val)
 void set_word_cache(cache_t *cache, uword_t addr, word_t val)
 {
     /* your implementation */
+    cache_line_t* line = get_line(cache, addr);
+
+    if(line == NULL) {
+        return;
+    }
+
+    word_t* cacheVal = (word_t*)(line->data + getOffset(cache, addr));
+    *cacheVal = val;
+    line->dirty = true;
+
+    line->lru = lru_counter;
+    lru_counter++;
 }
 
 /*
