@@ -280,6 +280,18 @@ bool check_hit(cache_t *cache, uword_t addr, operation_t operation)
     return false;
 }
 
+void copyBlock(cache_t *cache, byte_t* dest, byte_t* src) {
+    size_t B = pow(2, cache->b);
+    for(int i = 0; i < B; i++) {
+        dest[i] = src[i];
+    }
+}
+
+uword_t getAddr(cache_t *cache, uword_t tag, int s) {
+    uword_t result = tag * pow(2, cache->b + cache->s);
+    return result + s * pow(2, cache->b);
+}
+
 /* TODO:
  * Handles Misses, evicting from the cache if necessary.
  * Fill out the evicted_line_t struct with info regarding the evicted line.
@@ -291,17 +303,24 @@ evicted_line_t *handle_miss(cache_t *cache, uword_t addr, operation_t operation,
     evicted_line->data = (byte_t *) calloc(B, sizeof(byte_t));
     /* your implementation */
 
+    // Default value for evicted line to prevent incorrect writes
+    evicted_line->dirty = false;
+    evicted_line->valid = false;
+
     cache_line_t* line = select_line(cache, addr);
     if(line->valid) {
         // Evict the line
-        evicted_line->data = line->data;
+        evicted_line->data = calloc(pow(2,cache->b), 1);
+        copyBlock(cache, evicted_line->data, line->data);
         evicted_line->dirty = line->dirty;
         evicted_line->valid = line->valid;
-        evicted_line->addr = line->tag + getSet(cache, addr);
+        evicted_line->addr = getAddr(cache, line->tag, getSet(cache, addr));
         line->dirty ? dirty_eviction_count++ : clean_eviction_count++;
     }
 
-    line->data = incoming_data;
+    if(incoming_data != NULL) {
+        copyBlock(cache, line->data, incoming_data);
+    }
     line->valid = true;
     if(operation == WRITE) {
         line->dirty = true;
@@ -329,7 +348,7 @@ void get_byte_cache(cache_t *cache, uword_t addr, byte_t *dest)
         return;
     }
 
-    dest = &line->data[getOffset(cache, addr)];
+    *dest = line->data[getOffset(cache, addr)];
 
     line->lru = lru_counter;
     lru_counter++;
@@ -350,9 +369,10 @@ void get_word_cache(cache_t *cache, uword_t addr, word_t *dest) {
     }
 
     int offset = getOffset(cache, addr);
+    byte_t* temp = (byte_t*) dest;
     for(int i = 0; i < 8; i++) {
         
-        *(dest + i) = line->data[offset + i];
+        temp[i] = line->data[offset + i];
     }
 
     line->lru = lru_counter;

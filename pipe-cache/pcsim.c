@@ -98,7 +98,7 @@ int sim_main(int argc, char **argv)
     /* your implementation */
 
     /* Parse the command line arguments */
-    while ((c = getopt(argc, argv, "htl:v:i")) != -1) {
+    while ((c = getopt(argc, argv, "htl:v:is:E:b:d:")) != -1) {
         switch(c) {
         case 'h':
             usage(argv[0]);
@@ -116,6 +116,34 @@ int sim_main(int argc, char **argv)
         case 'i':
 	        interactive = true;
 	        break;
+        case 's':
+            s = atoi(optarg);
+            if(s < 0) {
+                printf("Invalid s %d\n", s);
+                usage(argv[0]);
+            }
+            break;
+        case 'E':
+            E = atoi(optarg);
+            if(s < 0) {
+                printf("Invalid s %d\n", s);
+                usage(argv[0]);
+            }
+            break;
+        case 'b':
+            b = atoi(optarg);
+            if(s < 0) {
+                printf("Invalid s %d\n", s);
+                usage(argv[0]);
+            }
+            break;
+        case 'd':
+            d = atoi(optarg);
+            if(s < 0) {
+                printf("Invalid s %d\n", s);
+                usage(argv[0]);
+            }
+            break;
         default:
             printf("Invalid option '%c'\n", c);
             usage(argv[0]);
@@ -540,7 +568,7 @@ void do_fetch_stage()
 
     // Get op code
     byte_t instr;
-    imem_error = !get_byte_val(mem, f_pc, &instr);
+    imem_error = !get_byte_val_I(mem, f_pc, &instr);
     if(!imem_error) { // TODO: handle error
         imem_icode = GET_ICODE(instr);
         imem_ifun = GET_FUN(instr);
@@ -555,7 +583,7 @@ void do_fetch_stage()
             // Register arguments
             if(instrInfo->arg1 == R_ARG || instrInfo->arg2 == R_ARG) {
                 byte_t registers;
-                imem_error = !get_byte_val(mem, f_pc + 1, &registers); // TODO: handle error
+                imem_error = !get_byte_val_I(mem, f_pc + 1, &registers); // TODO: handle error
                 if(!imem_error) {
                     decode_input->ra = GET_RA(registers);
                     decode_input->rb = GET_RB(registers);
@@ -566,7 +594,7 @@ void do_fetch_stage()
             if(!imem_error && (instrInfo->arg1 == I_ARG || instrInfo->arg1 == M_ARG || instrInfo->arg2 == M_ARG)) {
                 int displacement = instrInfo->arg2 == NO_ARG ? 1 : 2;
                 word_t valc;
-                imem_error = !get_word_val(mem, f_pc + displacement, &valc);
+                imem_error = !get_word_val_I(mem, f_pc + displacement, &valc);
                 if(!imem_error) {
                     decode_input->valc = valc;
                 }
@@ -793,6 +821,7 @@ void do_memory_stage()
     mem_data = 0;
     mem_write = false;
     bool mem_read = false;
+    dmem_status = READY;
 
     /* your implementation */
     byte_t code = memory_output->icode;
@@ -809,8 +838,6 @@ void do_memory_stage()
         return;
     }
 
-    set_word_val_D()
-
     // Handle instruction
     word_t valm;
     switch(code) {
@@ -820,37 +847,40 @@ void do_memory_stage()
             mem_addr = memory_output->vale;
             mem_data = memory_output->vala;
             mem_write = true;
-            dmem_status = !set_word_val_D(mem, mem_addr, mem_data);
+            dmem_status = set_word_val_D(mem, mem_addr, mem_data);
             break;
         case I_MRMOVQ:
             mem_addr = memory_output->vale;
             mem_read = true;
-            dmem_status = !get_word_val_D(mem, mem_addr, &valm);
+            dmem_status = get_word_val_D(mem, mem_addr, &valm);
             writeback_input->valm = valm;
             break;
         case I_RET:
         case I_POPQ:
             mem_addr = memory_output->vala;
             mem_read = true;
-            dmem_status = !get_word_val_D(mem, mem_addr, &valm);
+            dmem_status = get_word_val_D(mem, mem_addr, &valm);
             writeback_input->valm = valm;
             break;
     }
 
-    STAT
+    stat_t status;
     switch(dmem_status) {
         case ERROR:
-            writeback_input->status = STAT_ADR;
+            status = STAT_ADR;
             break;
         case IN_FLIGHT:
             // TODO
+            status = STAT_AOK;
             break;
         case READY:
-            write
+            status = STAT_AOK;
+            break;
     }
+    writeback_input->status = status;
 
     if (mem_read) {
-        if ((dmem_status = get_word_val_D(mem, mem_addr, &mem_data)) != READY) {
+        if (dmem_status != READY) {
             sim_log("\tMemory: Couldn't Read from 0x%llx\n", mem_addr);
         } else {
             sim_log("\tMemory: Read 0x%llx from 0x%llx\n",
@@ -859,7 +889,7 @@ void do_memory_stage()
     }
 
     if (mem_write) {
-        if ((dmem_status = set_word_val_D(mem, mem_addr, mem_data)) != READY) {
+        if (dmem_status != READY) {
             sim_log("\tMemory: Couldn't write to address 0x%llx\n", mem_addr);
         } else {
             sim_log("\tMemory: Wrote 0x%llx to address 0x%llx\n", mem_data, mem_addr);
@@ -1252,6 +1282,24 @@ void do_stall_check()
 
     if(writeback_output->status == STAT_HLT || writeback_output->status == STAT_ADR || writeback_output->status == STAT_INS) {
         stallWriteback = true;
+    }
+
+    // Handle memory stalling
+    if(dmem_status == IN_FLIGHT) {
+        stallFetch = true;
+        bubbleFetch = false;
+
+        stallDecode = true;
+        bubbleDecode = false;
+
+        stallExecute = true;
+        bubbleExecute = false;
+
+        stallMemory = true;
+        bubbleMemory = false;
+
+        stallWriteback = true;
+        bubbleWriteback = false;
     }
 
     // Set each stage's state
