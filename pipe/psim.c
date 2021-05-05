@@ -591,6 +591,7 @@ void do_fetch_stage()
         decode_input->status = STAT_AOK;
     }
 
+
     /* logging function, do not change this */
     if (!imem_error) {
         sim_log("\tFetch: f_pc = 0x%llx, f_instr = %s\n",
@@ -735,13 +736,28 @@ void do_execute_stage()
             memory_input->takebranch = cond_holds(cc, execute_output->ifun);
             break;
         case I_RRMOVQ:
-            // Put value to be stored in vale
-            vale = execute_output->vala;
-            memory_input->vale = vale;
+            // Check if condition holds
+            if(!cond_holds(cc, execute_output->ifun)) {
+                // Don't move anything
+                memory_input->vale = get_reg_val(reg, execute_output->deste);
+                memory_input->deste = REG_NONE;
+            } else {
+                // Put value to be stored in vale
+                vale = execute_output->vala;
+                memory_input->vale = vale;
+            }
+            
             break;
     }
 
     memory_input->status = STAT_AOK;
+
+    // Check exceptions
+    if((memory_output->status == STAT_HLT || memory_output->status == STAT_ADR || memory_output->status == STAT_INS) ||
+        (writeback_output->status == STAT_HLT || writeback_output->status == STAT_ADR || writeback_output->status == STAT_INS)) {
+
+        setcc = false;
+    }
 
     /* logging functions, do not change these */
     if (execute_output->icode == I_JMP) {
@@ -881,6 +897,7 @@ p_stat_t pipe_cntl(char *name, word_t stall, word_t bubble)
     }
 }
 
+// rwset_t : a struct for holding information about the read set and write set for a given instruction
 typedef struct {
     itype_t name;     // Name of instruction
 
@@ -902,6 +919,7 @@ typedef struct {
     stage_id_t stage; // Gives the first stage where forwarding is possible
 } rwset_t, *rwset_ptr;
 
+// An array of rwset_t objects holding read and write set data for each instruction
 rwset_t read_write_sets[] = 
 {
     {I_HALT,    0,  0,  0,  0,  0,  0,  0}, 
@@ -921,6 +939,7 @@ rwset_t read_write_sets[] =
     {I_SHF,     1,  0,  0,  0,  1,  0,  EXECUTE_STAGE}
 };
 
+// Given a pointer to the decode stage registers, returns the read set of the instruction in decode in readSet
 void getReadSet(decode_ptr decode, reg_id_t readSet[2]) {
     // Get read-write set data for the instruction
     itype_t code = decode->icode;
@@ -950,6 +969,7 @@ void getReadSet(decode_ptr decode, reg_id_t readSet[2]) {
     }
 }
 
+// Given a stage, returns the write set for the instruction at that stage in writeSet
 void getWriteSet(stage_id_t stage, reg_id_t writeSet[2]) {
 
     writeSet[0] = REG_NONE;
@@ -962,8 +982,10 @@ void getWriteSet(stage_id_t stage, reg_id_t writeSet[2]) {
 
     switch(stage) {
         case EXECUTE_STAGE:
+            // Conditional move commands can change deste
             code = execute_output->icode;
-            deste = execute_output->deste;
+            // Get final version of deste
+            deste = memory_input->deste;
             destm = execute_output->destm;
             break;
         case MEMORY_STAGE:
@@ -983,6 +1005,7 @@ void getWriteSet(stage_id_t stage, reg_id_t writeSet[2]) {
 
     rwset_t writeData;
 
+    // Get write set data for the instruction
     writeData = read_write_sets[code];
 
     // Check if instruction writes deste
@@ -996,6 +1019,7 @@ void getWriteSet(stage_id_t stage, reg_id_t writeSet[2]) {
     }
 }
 
+// Given a read set and a write set, determines if vala (readSet[0]) is depends on any registers in writeSet
 bool valADependent(reg_id_t readSet[2], reg_id_t writeSet[2]) {
     if(readSet[0] == REG_NONE) {
         return false;
@@ -1007,48 +1031,84 @@ bool valADependent(reg_id_t readSet[2], reg_id_t writeSet[2]) {
     return false;
 }
 
+// Given a read set and a write set, determines if valb (readSet[1]) is depends on any registers in writeSet
 bool valBDependent(reg_id_t readSet[2], reg_id_t writeSet[2]) {
+    // ReadSet[1] holds the register that valB is dependent on
     if(readSet[1] == REG_NONE) {
+        // No dependence on any register
         return false;
     }
 
     if(readSet[1] == writeSet[0] || readSet[1] == writeSet[1]) {
+        // Dependence on either vale or valm
         return true;
     }
+
+    // No dependent registers in the writeSet
     return false;
 }
 
+/*
+ * Returns true if forwarding is possible for vala or valb, given a readSet, a writeSet, and the stage the writeSet is referring to.
+ * stage - the stage that the instruction in writeSet is from
+ * a - When true, determines if vala can be forwarded. When false, determines valb instead.
+ */
 bool forwardingPossible(reg_id_t readSet[2], reg_id_t writeSet[2], stage_id_t stage, bool a) {
     stage_id_t earliestStage;
 
+    // Get the index for which value to check forwarding
     int index = !a;
 
+    bool dependent = false;
     if(readSet[index] == writeSet[0]) {
+        // Dependent on vale, which is calculated in execute
         earliestStage = EXECUTE_STAGE;
-    } else if(readSet[index] == writeSet[1]) {
+        dependent = true;
+    }
+
+    if(readSet[index] == writeSet[1]) {
+        // Dependent on valm, which is calculated in memory
         earliestStage = MEMORY_STAGE;
-    } else {
+        dependent = true;
+    }
+
+    if(!dependent) {
+        // No dependence, no forwarding
         return false;
     }
 
+    // Return true if the original instruction is at the earliest stage for forwarding
     return stage >= earliestStage;
 }
 
+/*
+ * Returns the value to be forwarded for vala or valb
+ * readSet - the read set of the instruction in the decode stage
+ * writeSet - the write set of the instruction to forward from
+ * stage - the stage of the instruction to forward from
+ * a - a boolean telling the function to return the forwarded value for vala when true.
+ * Returns the value for valb when false.
+ */
 word_t getForwardValue(reg_id_t readSet[2], reg_id_t writeSet[2], stage_id_t stage, bool a) {
     bool returnE;
 
+    // Get the index for the value to forward
     int index = !a;
 
     if(readSet[index] == writeSet[0]) {
         // Dependent on eval
         returnE = true;
-    } else {
+    }
+    
+    if(readSet[index] == writeSet[1]) {
         // Dependent on mval
         returnE = false;
     }
 
+    // Return the correct value based on the stage
     switch(stage) {
         case EXECUTE_STAGE:
+            // Execute only has an vale
             return memory_input->vale;
             break;
         case MEMORY_STAGE:
@@ -1106,9 +1166,11 @@ void do_stall_check()
                 if(!forwardA && valADependent(decodeReadSet, writeSet)) {
                     // Handle forwarding
                     if(forwardingPossible(decodeReadSet, writeSet, stages[i], true)) {
+                        // Get the forward value
                         execute_input->vala = getForwardValue(decodeReadSet, writeSet, stages[i], true);
                         forwardA = true;
                     } else {
+                        // Can't forward yet, stall
                         stall = true;
                         break;
                     }
@@ -1118,22 +1180,25 @@ void do_stall_check()
                 if(!forwardB && valBDependent(decodeReadSet, writeSet)) {
                     // Handle forwarding
                     if(forwardingPossible(decodeReadSet, writeSet, stages[i], false)) {
+                        // Get the forward value
                         execute_input->valb = getForwardValue(decodeReadSet, writeSet, stages[i], false);
                         forwardB = true;
                     } else {
+                        // Can't forward yet, stall
                         stall = true;
                         break;
                     }
                 }
             }
             
-
+            // Check if both forwarded values have been found
             if(forwardA && forwardB) {
                 break;
             }
         }
     }
 
+    // Check if stalling is needed at decode
     if(stall) {
         stallFetch = true;
         stallDecode = true;
@@ -1162,6 +1227,16 @@ void do_stall_check()
         bubbleExecute = true;
     }
 
+    // Handle exceptions
+    if(writeback_input->status == STAT_HLT || writeback_input->status == STAT_ADR || writeback_input->status == STAT_INS) {
+        bubbleMemory = true;
+    }
+
+    if(writeback_output->status == STAT_HLT || writeback_output->status == STAT_ADR || writeback_output->status == STAT_INS) {
+        stallWriteback = true;
+    }
+
+    // Set each stage's state
     fetch_state->op     = pipe_cntl("PC",   stallFetch,         bubbleFetch);
     decode_state->op    = pipe_cntl("ID",   stallDecode,        bubbleDecode);
     execute_state->op   = pipe_cntl("EX",   stallExecute,       bubbleExecute);

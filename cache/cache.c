@@ -239,7 +239,7 @@ cache_line_t *select_line(cache_t *cache, uword_t addr)
     }
 
     cache_line_t* lines = cache->sets[getSet(cache, addr)].lines;
-    uword_t earliestTime = 0;
+    uword_t earliestTime = LLONG_MAX;
     unsigned int index = 0;
     unsigned int associativity = cache->E;
     for(int i = 0; i < associativity; i++) {
@@ -247,7 +247,7 @@ cache_line_t *select_line(cache_t *cache, uword_t addr)
         if(!line->valid) {
             return line;
         }
-        if(line->lru <= earliestTime) {
+        if(line->lru < earliestTime) {
             earliestTime = line->lru;
             index = i;
         }
@@ -270,8 +270,9 @@ bool check_hit(cache_t *cache, uword_t addr, operation_t operation)
         if(operation == WRITE) {
             line->dirty = true;
         }
-        line->lru = lru_counter;
+
         lru_counter++;
+        line->lru = lru_counter;
         return true;
     }
     //Miss
@@ -308,8 +309,9 @@ evicted_line_t *handle_miss(cache_t *cache, uword_t addr, operation_t operation,
         line->dirty = false;
     }
     line->tag = getTag(cache, addr);
-    line->lru = lru_counter;
     lru_counter++;
+    line->lru = lru_counter;
+    
 
     return evicted_line;
 }
