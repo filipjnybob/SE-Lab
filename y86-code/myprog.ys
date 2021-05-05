@@ -1,44 +1,24 @@
-	.pos 0
-init:
-        #Set up stack pointer
-        irmovq stack, %rsp
-        call main
-        halt
+irmovq stack, %rsp
+irmovq $30, %rcx
+rmmovq %rcx, $0x50
+irmovq $1, %rax
+rrmovq %rax, %rdi
+call count
+halt
 
-        .align 8
-
-array:
-        .quad 0x00000000000020
-        .quad 0x00000000000020
-        .quad 0x00000000000020
-        .quad 0x00000000000040
-        .quad 0x00000000000000
-        .quad 0x00000000000020
-        .quad 0x00000000000020
-        .quad 0x00000000000020
-
-main:
-        irmovq array, %rdi
-        call max
-        ret
-
-max:
-        irmovq $8, %r9
-        irmovq $0, %rax
-        mrmovq (%rdi), %rax     # get first array val
-
-loop:
-        addq %r9, %rdi
-        mrmovq (%rdi), %rdx
-	mrmovq (%rdi), %rcx
-        andq %rdx, %rdx
-        je done
-        subq %rax, %rdx
-        cmovg %rcx, %rax
-        jmp loop
+.pos 0x1000
+count:
+    mrmovq $0x50, %rsi
+    subq %rdi, %rsi
+    jle done
+    irmovq $1, %r9
+    addq %r9, %rdi
+    call count
+    rrmovq %rax, %rdi
 
 done:
-        ret
+    rrmovq %rdi, %rax
+    ret
 
-        .pos 0x100
+.pos 0xF00
 stack:
